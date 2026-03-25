@@ -673,7 +673,7 @@ class ServiceManagerApp:
                     try: dly = int(r.get('Delay', 0))
                     except: dly = 0
 
-                    self.log_action(f"▶ Step {index + 1}/{total_steps}: {act.upper()} {srv} ({ip})")
+                    self.log_action(f"▶ Step {index + 1}/{total_steps}: {act.upper()} {srv} ({ip}), delay {dly}s")
 
                     conn = self.get_wmi_connection(ip)
                     if conn:
@@ -720,6 +720,7 @@ class ServiceManagerApp:
                             self.log_action(f"  ❌ Service Error {srv}: {inner_e}")
 
                     if dly > 0 and not self.stop_runbook_flag:
+                        self.log_action(f"Waiting {dly}s for next step")
                         time.sleep(1 if self.dry_run.get() else dly)
 
                 self.log_action(f"🏁 Finished. {len(self.undo_buffer)} changes recorded.")
@@ -1248,7 +1249,10 @@ class ServiceManagerApp:
     def _is_actually_local(self, ip):
         """Checks if IP is local."""
         if ip in ['127.0.0.1', 'localhost']: return True
+        # Uncomment below for tests purposes
         else: return False
+
+        # Comment below if you would like to test your local IP (not 127....)
         # try:
         #     local_ips = socket.gethostbyname_ex(socket.gethostname())[2]
         #     return ip in local_ips
@@ -1257,17 +1261,36 @@ class ServiceManagerApp:
     def export_as_runbook_template(self):
         """Exports selected services as a runbook template."""
         selected = self.tree.selection()
-        path = filedialog.asksaveasfilename(defaultextension=".csv")
+
+        if not selected:
+            messagebox.showwarning("Export", "Please select at least one service from the list first.")
+            return
+
+        path = filedialog.asksaveasfilename(
+            defaultextension=".csv",
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+            title="Save Runbook Template"
+        )
+
         if path:
             try:
                 with open(path, 'w', newline='', encoding='utf-8') as f:
                     writer = csv.writer(f)
+                    # Header matching the format expected by load_runbook
                     writer.writerow(["IP", "ServiceName", "Action", "Delay"])
+
                     for i in selected:
-                        v = self.tree.item(i, 'values')
-                        writer.writerow([v[0], v[1], "restart", "5"])
+                        values = self.tree.item(i, 'values')
+                        # values[0] is IP, values[1] is Service Name
+                        writer.writerow([values[0], values[1], "restart", "5"])
+
+                self.log_action(f"Successfully exported runbook template to: {path}")
+                messagebox.showinfo("Success", f"Exported {len(selected)} services to file.")
+
             except Exception as e:
-                messagebox.showerror("Error", f"Failed to export template: {e}")
+                error_msg = f"Error saving file: {str(e)}"
+                self.log_action(f"❌ {error_msg}")
+                messagebox.showerror("Save Error", error_msg)
 
 if __name__ == '__main__':
     root = tk.Tk()
