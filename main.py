@@ -12,7 +12,7 @@ import getpass
 from concurrent.futures import ThreadPoolExecutor
 import socket
 import subprocess
-from collections import defaultdict  # Added for grouping tasks by IP
+from collections import defaultdict
 
 
 class ServiceManagerApp:
@@ -24,6 +24,7 @@ class ServiceManagerApp:
         self.all_data = []
         self.active_filters = {}
         self.snapshot_data = None
+        self.tree_map = {}  # Map (IP, ServiceNameLower) -> item_id for O(1) lookups
 
         # Column names for filters
         self.columns = {
@@ -44,12 +45,13 @@ class ServiceManagerApp:
         self.runbook_affected_services = []
 
         self.undo_buffer = []
-        
+
         # Auto-refresh variables
         self.auto_refresh_active = False
         self.auto_refresh_thread = None
 
     def load_config(self):
+        """Loads configuration from config.ini with optimized defaults."""
         self.config = configparser.ConfigParser()
         self.config_path = os.path.join(os.path.dirname(__file__), 'config.ini')
         if os.path.exists(self.config_path):
@@ -59,31 +61,40 @@ class ServiceManagerApp:
             self.exclude_list = [x.strip().lower() for x in
                                  self.config.get('Filters', 'exclude_names', fallback='').split(',') if x.strip()]
             self.groups = {k: v for k, v in self.config.items('Groups')} if self.config.has_section('Groups') else {}
-            
-            # Load TotalCMD path
+
+            # Load Settings
             self.totalcmd_path = self.config.get('Settings', 'totalcmd_path', fallback='')
+            self.wait_attempts = self.config.getint('Settings', 'wait_attempts', fallback=10)
+            self.wait_interval = self.config.getfloat('Settings', 'wait_interval', fallback=0.5)
         else:
             self.include_list, self.exclude_list, self.groups = [], [], {}
             self.totalcmd_path = ''
+            self.wait_attempts = 10
+            self.wait_interval = 0.5
 
     def log_action(self, msg):
-        """Logging to GUI console and audit file."""
+        """Logging to GUI console and audit file. Thread-safe."""
         timestamp = time.strftime('%Y-%m-%d %H:%M:%S')
         user = getpass.getuser()
         full_msg = f"[{timestamp}] USER:{user} | {msg}"
 
-        # Log to GUI
-        self.log_area.config(state='normal')
-        self.log_area.insert(tk.END, full_msg + "\n")
-        self.log_area.see(tk.END)
-        self.log_area.config(state='disabled')
+        # Thread-safe GUI update using self.root.after
+        self.root.after(0, self._log_to_gui, full_msg)
 
         # Log to file (Audit)
         try:
             with open("action_history.log", "a", encoding="utf-8") as f:
                 f.write(full_msg + "\n")
-        except:
-            pass
+        except Exception as e:
+            # Fallback print if file logging fails (prevent app crash)
+            print(f"Error writing to audit log: {e}")
+
+    def _log_to_gui(self, full_msg):
+        """Internal helper for UI logging on main thread."""
+        self.log_area.config(state='normal')
+        self.log_area.insert(tk.END, full_msg + "\n")
+        self.log_area.see(tk.END)
+        self.log_area.config(state='disabled')
 
     def setup_ui(self):
         # --- TOP PANEL ---
@@ -114,15 +125,16 @@ class ServiceManagerApp:
 
         self.dry_run = tk.BooleanVar(value=False)
         tk.Checkbutton(opt_frame, text="What-If (Dry Run)", variable=self.dry_run, fg="red").pack(anchor='w')
-        
+
         # Auto-refresh UI
         ar_frame = tk.Frame(opt_frame)
         ar_frame.pack(anchor='w', pady=2)
-        
+
         self.auto_refresh_var = tk.BooleanVar(value=False)
-        self.chk_auto_refresh = tk.Checkbutton(ar_frame, text="Auto-refresh", variable=self.auto_refresh_var, command=self.toggle_auto_refresh)
+        self.chk_auto_refresh = tk.Checkbutton(ar_frame, text="Auto-refresh", variable=self.auto_refresh_var,
+                                               command=self.toggle_auto_refresh)
         self.chk_auto_refresh.pack(side=tk.LEFT)
-        
+
         tk.Label(ar_frame, text="Sec:").pack(side=tk.LEFT, padx=2)
         self.ent_refresh_interval = tk.Entry(ar_frame, width=3)
         self.ent_refresh_interval.insert(0, "10")
@@ -144,10 +156,6 @@ class ServiceManagerApp:
         self.runbook_ctrl_frame = tk.LabelFrame(top_frame, text="Runbook Control", fg="#005a9e")
         self.runbook_ctrl_frame.pack(side=tk.LEFT, padx=10, fill=tk.Y)
 
-        # Container for buttons
-        btn_box = tk.Frame(self.runbook_ctrl_frame)
-        btn_box.pack(side=tk.TOP, fill=tk.X, pady=5)
-
         # Loaded file name
         self.lbl_runbook_name = tk.Label(self.runbook_ctrl_frame, text="File: (none selected)",
                                          fg="blue", font=('Arial', 8, 'italic'))
@@ -168,7 +176,6 @@ class ServiceManagerApp:
 
         tk.Button(btn_box, text="VALIDATE ROLLBACK", command=self.validate_undo_buffer_realtime,
                   bg="#661045", fg="white", font=('Arial', 9, 'bold')).pack(side=tk.LEFT, padx=2)
-
 
         # --- TABLE ---
         self.tree_frame = tk.Frame(self.root)
@@ -195,7 +202,6 @@ class ServiceManagerApp:
                                 font=('Consolas', 9))
         self.log_area.pack(fill=tk.X, padx=10, pady=5)
 
-        # Pre-initialize menu variable, but content is dynamic now
         self.service_context_menu = tk.Menu(self.root, tearoff=0)
 
     def add_menu_bar(self):
@@ -253,30 +259,26 @@ class ServiceManagerApp:
                 if interval < 1: interval = 5
             except ValueError:
                 interval = 10
-            
-            # Wait for the interval
+
             for _ in range(interval):
                 if not self.auto_refresh_active:
                     return
                 time.sleep(1)
-            
-            # Perform refresh
+
             if self.auto_refresh_active:
                 self.refresh_all_visible_services()
 
     def refresh_all_visible_services(self):
-        """Refreshes all services currently in the table in parallel."""
-        # 1. Get unique IPs currently in the table
+        """Refreshes all services currently in the table in parallel using tree_map."""
         ips_to_scan = set()
         for item in self.tree.get_children():
             val = self.tree.item(item, 'values')
             ips_to_scan.add(val[0])
-        
+
         if not ips_to_scan:
             return
 
         def update_worker(target_ip):
-            """Fetches data for one IP."""
             pythoncom.CoInitialize()
             updated_data = []
             try:
@@ -284,7 +286,6 @@ class ServiceManagerApp:
                 if conn:
                     services = conn.Win32_Service()
                     for s in services:
-                        # Collect relevant data
                         updated_data.append({
                             'name': s.Name,
                             'status': s.State,
@@ -292,8 +293,8 @@ class ServiceManagerApp:
                             'display_name': s.DisplayName,
                             'start_name': s.StartName
                         })
-            except:
-                pass
+            except Exception as e:
+                self.log_action(f"Update error for {target_ip}: {e}")
             finally:
                 pythoncom.CoUninitialize()
             return target_ip, updated_data
@@ -302,43 +303,32 @@ class ServiceManagerApp:
             try:
                 target_ip, services_data = future.result()
                 if not services_data: return
-                
-                # Create a map for fast lookup
-                svc_map = {s['name'].lower(): s for s in services_data}
-                
-                # Update rows in main thread
-                # This needs to be efficient. We iterate rows once.
-                for item in self.tree.get_children():
-                    val = self.tree.item(item, 'values')
-                    row_ip = val[0]
-                    row_name = val[1].lower()
-                    
-                    if row_ip == target_ip and row_name in svc_map:
-                        new_s = svc_map[row_name]
-                        # Check if anything changed to avoid unnecessary redraws
-                        if (val[3] != new_s['status'] or 
-                            val[4] != new_s['start_type']):
-                            
+
+                for new_s in services_data:
+                    row_name = new_s['name'].lower()
+                    key = (target_ip, row_name)
+                    if key in self.tree_map:
+                        item = self.tree_map[key]
+                        val = self.tree.item(item, 'values')
+
+                        if (val[3] != new_s['status'] or val[4] != new_s['start_type']):
                             new_vals = (
-                                target_ip, 
-                                new_s['name'], 
-                                new_s['display_name'], 
-                                new_s['status'], 
-                                new_s['start_type'], 
+                                target_ip,
+                                new_s['name'],
+                                new_s['display_name'],
+                                new_s['status'],
+                                new_s['start_type'],
                                 new_s['start_name']
                             )
                             tag = 'running' if new_s['status'].lower() == 'running' else 'stopped'
-                            
                             self.tree.item(item, values=new_vals, tags=(tag,))
                             self.update_buffer_data(item)
             except Exception as e:
-                print(f"Update error: {e}")
+                print(f"Apply update error: {e}")
 
-        # Launch threads
         with ThreadPoolExecutor(max_workers=20) as executor:
             for ip in ips_to_scan:
                 future = executor.submit(update_worker, ip)
-                # Schedule update on main thread when ready
                 self.root.after(0, lambda f=future: apply_updates(f))
 
     def save_full_snapshot_to_file(self):
@@ -362,14 +352,17 @@ class ServiceManagerApp:
                     'ip': v[0],
                     'name': v[1],
                     'display_name': v[2],
-                    'status': v[3],  # np. Running
-                    'start_type': v[4]  # np. Automatic
+                    'status': v[3],
+                    'start_type': v[4]
                 })
 
-            with open(path, 'w', encoding='utf-8') as f:
-                json.dump(snapshot_data, f, indent=4)
-
-            self.log_action(f"✅ Snapshot saved to file: {os.path.basename(path)}")
+            try:
+                with open(path, 'w', encoding='utf-8') as f:
+                    json.dump(snapshot_data, f, indent=4)
+                self.log_action(f"✅ Snapshot saved to file: {os.path.basename(path)}")
+            except Exception as e:
+                self.log_action(f"❌ Failed to save snapshot: {e}")
+                messagebox.showerror("Error", f"Failed to save snapshot: {e}")
 
     def validate_undo_buffer_realtime(self):
         """Compares state in Undo Buffer with actual state on servers."""
@@ -386,13 +379,11 @@ class ServiceManagerApp:
 
             for entry in self.undo_buffer:
                 ip, s_name = entry['ip'], entry['name']
-                # Buffer data (expected after rollback)
                 exp_state = str(entry.get('status', '')).lower().strip()
                 exp_mode = mode_aliases.get(str(entry.get('start_type', '')).lower().strip(), "")
 
                 conn = self.get_wmi_connection(ip)
                 if not conn:
-                    self.log_action(f"  ❌ No connection to {ip}")
                     continue
 
                 try:
@@ -400,12 +391,10 @@ class ServiceManagerApp:
                     if not s_list: continue
                     s = s_list[0]
 
-                    # Refresh UI with the fresh state we just fetched
                     new_vals = (ip, s.Name, s.DisplayName, s.State, s.StartMode, s.StartName)
                     tag = 'running' if s.State.lower() == 'running' else 'stopped'
                     self.root.after(0, lambda i=ip, n=s_name, nv=new_vals, t=tag: self.fast_ui_update(i, n, nv, t))
 
-                    # Server data (actual)
                     curr_state = str(s.State).lower().strip()
                     raw_curr_mode = str(s.StartMode).lower().strip()
                     curr_mode = "automatic" if raw_curr_mode == "auto" else raw_curr_mode
@@ -431,15 +420,15 @@ class ServiceManagerApp:
         threading.Thread(target=run_validation, daemon=True).start()
 
     def fast_ui_update(self, ip, s_name, new_vals, tag):
-        """Updates a row in the treeview without making new WMI calls."""
-        for item in self.tree.get_children():
-            v = self.tree.item(item, 'values')
-            if v[0] == ip and v[1] == s_name:
-                self.tree.item(item, values=new_vals, tags=(tag,))
-                self.update_buffer_data(item)
-                break
+        """Updates a row in the treeview using tree_map."""
+        key = (ip, s_name.lower())
+        if key in self.tree_map:
+            item = self.tree_map[key]
+            self.tree.item(item, values=new_vals, tags=(tag,))
+            self.update_buffer_data(item)
 
     def validate_snapshot_realtime(self):
+        """Validates a snapshot file against the actual state of servers."""
         path = filedialog.askopenfilename(filetypes=[("JSON files", "*.json")], title="Select snapshot for validation")
         if not path: return
 
@@ -454,13 +443,11 @@ class ServiceManagerApp:
             pythoncom.CoInitialize()
             self.log_action(f"🔍 START VALIDATION: {os.path.basename(path)}")
 
-            # Mapping for comparison
             mode_aliases = {"auto": "automatic", "automatic": "automatic", "manual": "manual", "disabled": "disabled"}
             mismatches = 0
 
             for entry in data_to_check:
                 ip, s_name = entry['ip'], entry['name']
-                # Snapshot data (expected)
                 exp_state = str(entry.get('status', '')).lower().strip()
                 exp_mode = mode_aliases.get(str(entry.get('start_type', '')).lower().strip(), "")
 
@@ -472,25 +459,21 @@ class ServiceManagerApp:
                     if not s_list: continue
                     s = s_list[0]
 
-                    # Refresh UI with the fresh state we just fetched
                     new_vals = (ip, s.Name, s.DisplayName, s.State, s.StartMode, s.StartName)
                     tag = 'running' if s.State.lower() == 'running' else 'stopped'
                     self.root.after(0, lambda i=ip, n=s_name, nv=new_vals, t=tag: self.fast_ui_update(i, n, nv, t))
 
-                    # Server data (actual)
                     curr_state = str(s.State).lower().strip()
                     raw_curr_mode = str(s.StartMode).lower().strip()
                     curr_mode = "automatic" if raw_curr_mode == "auto" else raw_curr_mode
 
-                    # COMPARISON
                     if curr_state != exp_state or curr_mode != exp_mode:
                         mismatches += 1
                         self.log_action(
                             f"‼️ MISMATCH {ip} [{s_name}]: Is {curr_mode}/{curr_state}, expected {exp_mode}/{exp_state}")
-                        # Highlight in table
                         self.root.after(0, lambda i=ip, sn=s_name: self.highlight_mismatch(i, sn))
                 except Exception as ex:
-                    self.log_action(f"❌ Error: {ex}")
+                    self.log_action(f"❌ Error during validation of {s_name}: {ex}")
 
             self.log_action(f"✅ Validation finished. Mismatches: {mismatches}")
             if mismatches == 0:
@@ -500,68 +483,60 @@ class ServiceManagerApp:
         threading.Thread(target=run_logic, daemon=True).start()
 
     def highlight_mismatch(self, ip, service_name):
-        """Helper function to visually mark error in table."""
-        for item in self.tree.get_children():
-            values = self.tree.item(item, 'values')
-            if values[0] == ip and values[1] == service_name:
-                self.tree.tag_configure('mismatch', background='#ffcccc', foreground='red')
-                self.tree.item(item, tags=('mismatch',))
-                break
-
+        """Helper function to visually mark error in table using tree_map."""
+        key = (ip, service_name.lower())
+        if key in self.tree_map:
+            item = self.tree_map[key]
+            self.tree.tag_configure('mismatch', background='#ffcccc', foreground='red')
+            self.tree.item(item, tags=('mismatch',))
 
     def load_snapshot_and_restore(self):
-        """Loads snapshot file and forces restore of service state (Startup Type -> Verify -> State)."""
+        """Loads snapshot file and forces restore with validation and configurable timeouts."""
         path = filedialog.askopenfilename(
             filetypes=[("JSON files", "*.json")],
             title="Select snapshot file to restore"
         )
+        if not path: return
 
-        if not path:
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                data_to_restore = json.load(f)
+            
+            # Data validation
+            if not isinstance(data_to_restore, list):
+                raise ValueError("Snapshot data must be a list.")
+            for entry in data_to_restore:
+                if not all(k in entry for k in ('ip', 'name', 'status', 'start_type')):
+                    raise ValueError(f"Invalid entry structure in snapshot: {entry}")
+        except Exception as e:
+            messagebox.showerror("Error", f"Snapshot validation failed: {e}")
             return
 
         if not messagebox.askyesno("Confirmation", "Are you sure you want to restore service state from this file?"):
             return
 
-        try:
-            with open(path, 'r', encoding='utf-8') as f:
-                data_to_restore = json.load(f)
-        except Exception as e:
-            messagebox.showerror("Error", f"Cannot read file: {e}")
-            return
-
         self.stop_runbook_flag = False
-
-        # Group entries by IP for parallel processing
         tasks_by_ip = defaultdict(list)
         for entry in data_to_restore:
             tasks_by_ip[entry['ip']].append(entry)
 
         def restore_worker(target_ip, entries):
-            """Worker function to restore services for a single IP."""
             pythoncom.CoInitialize()
-            
-            # WMI Mapping
-            mode_map = {"automatic": "Automatic", "manual": "Manual", "disabled": "Disabled", "auto": "Automatic", "boot": "Boot", "system": "System"}
             cmd_map = {"automatic": "Automatic", "manual": "Manual", "disabled": "Disabled", "auto": "Automatic"}
-            check_map = {"Automatic": ["Auto", "Automatic"], "Manual": ["Manual", "Manuell"], "Disabled": ["Disabled", "Deaktiviert"]}
+            check_map = {"Automatic": ["Auto", "Automatic"], "Manual": ["Manual", "Manuell"],
+                         "Disabled": ["Disabled", "Deaktiviert"]}
 
             try:
                 conn = self.get_wmi_connection(target_ip)
                 if not conn:
-                    self.log_action(f"❌ {target_ip}: No RPC/WMI connection.")
-                    pythoncom.CoUninitialize()
                     return
 
                 for entry in entries:
-                    if self.stop_runbook_flag:
-                        self.log_action(f"🛑 Restore stopped for {target_ip}")
-                        break
-
+                    if self.stop_runbook_flag: break
                     s_name = entry.get('name')
                     target_state = entry.get('status', '').lower()
                     raw_mode = entry.get('start_type', '').lower()
-                    target_mode = mode_map.get(raw_mode, "Automatic") # For display/logic
-                    target_cmd = cmd_map.get(raw_mode, "Automatic") # For command
+                    target_cmd = cmd_map.get(raw_mode, "Automatic")
 
                     try:
                         s_list = conn.Win32_Service(Name=s_name)
@@ -570,33 +545,27 @@ class ServiceManagerApp:
                             continue
                         s = s_list[0]
 
-                        # --- STEP 1: CORRECT STARTUP TYPE ---
-                        # Normalize current mode for comparison (WMI often returns 'Auto')
                         current_mode_normalized = s.StartMode.replace("Auto", "Automatic")
-                        
                         if current_mode_normalized != target_cmd:
                             self.log_action(f"  -> {s_name} ({target_ip}): Changing mode to {target_cmd}")
                             res, = s.ChangeStartMode(StartMode=target_cmd)
 
                             if res == 0:
-                                # Verification
                                 success_unlock = False
                                 valid_responses = check_map.get(target_cmd, [target_cmd])
-                                for _ in range(5):
-                                    time.sleep(0.7)
-                                    s = conn.Win32_Service(Name=s_name)[0]
-                                    if s.StartMode in valid_responses:
+                                # Use configurable timeout
+                                for _ in range(int(self.wait_attempts)):
+                                    time.sleep(self.wait_interval)
+                                    s_check = conn.Win32_Service(Name=s_name)[0]
+                                    if s_check.StartMode in valid_responses:
                                         success_unlock = True
                                         break
                                 if not success_unlock:
-                                    self.log_action(f"  [!] Timeout: {s_name} reports {s.StartMode}")
+                                    self.log_action(f"  [!] Timeout: {s_name} reports {s_check.StartMode}")
                             else:
                                 self.log_action(f"  [!] {s_name} ChangeStartMode Error: Code {res}")
-                        else:
-                            # Already correct, skip
-                            pass
 
-                        # --- STEP 2: STARTING / STOPPING ---
+                        s = conn.Win32_Service(Name=s_name)[0]
                         current_state = s.State.lower()
                         if target_state == "running" and current_state != "running":
                             self.log_action(f"  -> {s_name} ({target_ip}): Starting...")
@@ -609,12 +578,9 @@ class ServiceManagerApp:
                             if res != 0:
                                 self.log_action(f"  [!] {s_name} Stop Error: Code {res}")
 
-                        # Refresh UI
-                        self.root.after(0, lambda i=target_ip, sn=s_name: self.refresh_row_by_name(i, sn))
-
+                        self.refresh_row_by_name(target_ip, s_name)
                     except Exception as e:
                         self.log_action(f"❌ Error processing {s_name} on {target_ip}: {e}")
-
             except Exception as e:
                 self.log_action(f"❌ Connection error for {target_ip}: {e}")
             finally:
@@ -623,15 +589,11 @@ class ServiceManagerApp:
         def run_main():
             self.log_action(f"🔄 STARTING PARALLEL RESTORE FROM: {os.path.basename(path)}")
             with ThreadPoolExecutor(max_workers=20) as executor:
-                futures = [executor.submit(restore_worker, ip, entries) for ip, entries in tasks_by_ip.items()]
-                executor.shutdown(wait=True) # Wait for all workers to finish
-            
-            # Final refresh of all affected services
-            self.log_action("🔄 Performing final status refresh...")
-            self.refresh_selected_services_by_data(data_to_restore)
+                for ip, entries in tasks_by_ip.items():
+                    executor.submit(restore_worker, ip, entries)
             self.log_action("✅ RESTORE COMPLETED.")
+            self.refresh_selected_services_by_data(data_to_restore)
 
-        # Run in separate thread
         threading.Thread(target=run_main, daemon=True).start()
 
     def refresh_selected_services_by_data(self, service_data):
@@ -640,7 +602,7 @@ class ServiceManagerApp:
             pythoncom.CoInitialize()
             for s_info in service_data:
                 self.refresh_row_by_name(s_info['ip'], s_info['name'])
-                time.sleep(0.05) # Small delay to allow UI to process
+                time.sleep(0.05)
             pythoncom.CoUninitialize()
         threading.Thread(target=run, daemon=True).start()
 
@@ -669,45 +631,36 @@ class ServiceManagerApp:
                 with open(path, 'w', encoding='utf-8') as f:
                     json.dump(snapshot, f, indent=4)
                 self.log_action(f"✅ Saved snapshot of selected services ({len(snapshot)}) to {os.path.basename(path)}")
-                messagebox.showinfo("Success", f"Saved snapshot of {len(snapshot)} services.")
             except Exception as e:
-                messagebox.showerror("Error", f"Failed to save file: {e}")
+                self.log_action(f"❌ Failed to save snapshot: {e}")
+                messagebox.showerror("Error", f"Failed to save snapshot: {e}")
 
     def clear_all_filters(self):
         """Resets all header filters and shows all data."""
         self.active_filters = {}
-
-        if hasattr(self, 'filter_entries'):
-            for entry in self.filter_entries.values():
-                entry.delete(0, tk.END)
-
         self.apply_all_filters()
         self.log_action("🧹 All filters cleared.")
 
-
     def execute_runbook(self):
-        """Executes automation process based on CSV file with change registration to Undo Buffer."""
+        """Executes automation process with configurable timeouts."""
         if not self.current_runbook_path:
-            messagebox.showwarning("Error", "Load a Runbook file from the Automation menu first!")
+            messagebox.showwarning("Error", "Load a Runbook file first!")
             return
 
-        # Initialize flags and buffer
         self.stop_runbook_flag = False
-        self.undo_buffer = []  # Clear changes list before new run
+        self.undo_buffer = []
 
-        # Lock START button
         if hasattr(self, 'btn_start_runbook'):
             self.btn_start_runbook.config(state='disabled')
 
         def run_logic():
             pythoncom.CoInitialize()
             try:
-                # 1. Read file
                 with open(self.current_runbook_path, mode='r', encoding='utf-8') as f:
                     reader = list(csv.DictReader(f))
 
                 total_steps = len(reader)
-                self.log_action(f"🚀 START RUNBOOK: {total_steps} steps to execute.")
+                self.log_action(f"🚀 START RUNBOOK: {total_steps} steps.")
 
                 for index, r in enumerate(reader):
                     if self.stop_runbook_flag:
@@ -717,86 +670,59 @@ class ServiceManagerApp:
                     ip = r['IP'].strip()
                     srv = r['ServiceName'].strip()
                     act = r['Action'].strip().lower()
-
-                    try:
-                        dly = int(r.get('Delay', 0))
-                    except:
-                        dly = 0
+                    try: dly = int(r.get('Delay', 0))
+                    except: dly = 0
 
                     self.log_action(f"▶ Step {index + 1}/{total_steps}: {act.upper()} {srv} ({ip})")
 
-                    # --- EXECUTION LOGIC (WMI) ---
                     conn = self.get_wmi_connection(ip)
                     if conn:
-                        s_list = conn.Win32_Service(Name=srv)
-                        if s_list:
-                            s = s_list[0]
+                        try:
+                            s_list = conn.Win32_Service(Name=srv)
+                            if s_list:
+                                s = s_list[0]
+                                if not any(x['ip'] == ip and x['name'] == srv for x in self.undo_buffer):
+                                    self.undo_buffer.append({
+                                        'ip': ip, 'name': srv,
+                                        'status': s.State, 'start_type': s.StartMode
+                                    })
 
-                            # Save to Undo Buffer (if not already there)
-                            if not any(x['ip'] == ip and x['name'] == srv for x in self.undo_buffer):
-                                self.undo_buffer.append({
-                                    'ip': ip, 'name': srv,
-                                    'status': s.State, 'start_type': s.StartMode
-                                })
-
-                            # --- CHECK DRY RUN ---
-                            if self.dry_run.get():
-                                self.log_action(f"🔍 [DRY-RUN] Simulation: {act.upper()} on {srv} ({ip})")
-                            else:
-                                # Real WMI commands
-                                if act in ["automatic", "manual", "disabled"]:
-                                    m_map = {"automatic": "Automatic", "manual": "Manual", "disabled": "Disabled"}
-                                    s.ChangeStartMode(StartMode=m_map.get(act, "Automatic"))
-                                elif act == "stop":
-                                    res, = s.StopService()
-                                    if res == 0:
-                                        self.log_action(f"  ✅ Sent STOP signal to {srv}. Waiting for confirmation...")
-                                        for _ in range(10):
-                                            time.sleep(0.5)
-                                            s_check = conn.Win32_Service(Name=srv)[0]
-                                            if s_check.State.lower() == "stopped":
-                                                self.log_action(f"  ⏹️ Service {srv} has stopped.")
-                                                break
-                                    else:
-                                        self.log_action(f"  ❌ StopService Error: Code {res}")
-
-                                elif act == "start":
-                                    res, = s.StartService()
-                                    if res == 0:
-                                        self.log_action(f"  ✅ Sent START signal to {srv}. Verifying...")
-                                        for _ in range(10):
-                                            time.sleep(0.5)
-                                            s_check = conn.Win32_Service(Name=srv)[0]
-                                            if s_check.State.lower() == "running":
-                                                self.log_action(f"  ▶️ Service {srv} has started.")
-                                                break
-                                    elif res == 10:  # Already running
-                                        self.log_action(f"  ℹ️ Service {srv} is already running.")
-                                    else:
-                                        self.log_action(f"  ❌ StartService Error: Code {res}")
-
-                            # Refresh UI
-                            self.root.after(0, lambda i=ip, sn=srv: self.refresh_row_by_name(i, sn))
-
-                            # --- DELAY LOGIC ---
-                            if dly > 0 and not self.stop_runbook_flag:
-                                is_dry_run = self.dry_run.get()
-
-                                if is_dry_run:
-                                    self.log_action(
-                                        f"⏳ [DRY-RUN] Simulation delay: {dly} sec. (shortened to 1s)...")
-                                    actual_delay = 1
+                                if self.dry_run.get():
+                                    self.log_action(f"🔍 [DRY-RUN] Simulation: {act.upper()} on {srv} ({ip})")
                                 else:
-                                    self.log_action(f"⏳ Waiting: {dly} sec. after step {index + 1}...")
-                                    actual_delay = dly
+                                    if act in ["automatic", "manual", "disabled"]:
+                                        m_map = {"automatic": "Automatic", "manual": "Manual", "disabled": "Disabled"}
+                                        s.ChangeStartMode(StartMode=m_map.get(act, "Automatic"))
+                                    elif act == "stop":
+                                        res, = s.StopService()
+                                        if res == 0:
+                                            self.log_action(f"  ✅ Sent STOP signal. Waiting...")
+                                            for _ in range(int(self.wait_attempts)):
+                                                time.sleep(self.wait_interval)
+                                                if conn.Win32_Service(Name=srv)[0].State.lower() == "stopped":
+                                                    self.log_action(f"  ⏹️ Service {srv} stopped.")
+                                                    break
+                                        else: self.log_action(f"  ❌ Stop Error: {res}")
+                                    elif act == "start":
+                                        res, = s.StartService()
+                                        if res == 0:
+                                            self.log_action(f"  ✅ Sent START signal. Verifying...")
+                                            for _ in range(int(self.wait_attempts)):
+                                                time.sleep(self.wait_interval)
+                                                if conn.Win32_Service(Name=srv)[0].State.lower() == "running":
+                                                    self.log_action(f"  ▶️ Service {srv} running.")
+                                                    break
+                                        elif res == 10: self.log_action(f"  ℹ️ Already running.")
+                                        else: self.log_action(f"  ❌ Start Error: {res}")
 
-                                for _ in range(actual_delay):
-                                    if self.stop_runbook_flag:
-                                        break
-                                    time.sleep(1)
+                                self.refresh_row_by_name(ip, srv)
+                        except Exception as inner_e:
+                            self.log_action(f"  ❌ Service Error {srv}: {inner_e}")
 
-                self.log_action(f"🏁 Runbook finished. {len(self.undo_buffer)} changes recorded in undo buffer.")
+                    if dly > 0 and not self.stop_runbook_flag:
+                        time.sleep(1 if self.dry_run.get() else dly)
 
+                self.log_action(f"🏁 Finished. {len(self.undo_buffer)} changes recorded.")
                 if self.undo_buffer:
                     with open("last_runbook_snapshot.json", "w", encoding='utf-8') as f:
                         json.dump(self.undo_buffer, f, indent=4)
@@ -804,19 +730,15 @@ class ServiceManagerApp:
             except Exception as e:
                 self.log_action(f"❌ CRITICAL RUNBOOK ERROR: {e}")
             finally:
-                # Unlock START button
                 if hasattr(self, 'btn_start_runbook'):
                     self.root.after(0, lambda: self.btn_start_runbook.config(state='normal'))
                 pythoncom.CoUninitialize()
 
-        # Run loop in separate thread
         self.runbook_thread = threading.Thread(target=run_logic, daemon=True)
         self.runbook_thread.start()
 
-
-
     def load_snapshot_and_restore_from_data(self, data_to_restore):
-        # Group entries by IP for parallel processing
+        """Core restore logic used for both Snapshot restoration and Rollback."""
         tasks_by_ip = defaultdict(list)
         for entry in data_to_restore:
             tasks_by_ip[entry['ip']].append(entry)
@@ -824,90 +746,70 @@ class ServiceManagerApp:
         def restore_worker(target_ip, entries):
             pythoncom.CoInitialize()
             mode_map = {"automatic": "Automatic", "manual": "Manual", "disabled": "Disabled", "auto": "Automatic"}
-            
             try:
                 conn = self.get_wmi_connection(target_ip)
-                if not conn:
-                    self.log_action(f"❌ {target_ip}: Connection failed during rollback.")
-                    pythoncom.CoUninitialize()
-                    return
-
+                if not conn: return
                 for entry in entries:
                     if self.stop_runbook_flag: break
-                    
                     s_name = entry.get('name')
                     try:
                         s_list = conn.Win32_Service(Name=s_name)
                         if not s_list: continue
                         s = s_list[0]
-
-                        # 1. Startup Type (Check before change)
                         target_mode = mode_map.get(entry['start_type'].lower(), "Automatic")
                         current_mode_norm = s.StartMode.replace("Auto", "Automatic")
-                        
                         if current_mode_norm != target_mode:
                             s.ChangeStartMode(StartMode=target_mode)
                             time.sleep(0.5)
                             s = conn.Win32_Service(Name=s_name)[0]
-
-                        # 2. Status
                         t_state = entry['status'].lower()
                         if t_state == "running" and s.State.lower() != "running":
                             s.StartService()
                         elif t_state == "stopped" and s.State.lower() != "stopped":
                             s.StopService()
-
-                        self.root.after(0, lambda i=target_ip, sn=s_name: self.refresh_row_by_name(i, sn))
-                        self.log_action(f"  [OK] Restored {s_name} ({target_ip})")
-                        
+                        self.refresh_row_by_name(target_ip, s_name)
                     except Exception as ex:
-                        self.log_action(f"Rollback error for {s_name} on {target_ip}: {ex}")
-
+                        self.log_action(f"Rollback error for {s_name}: {ex}")
             except Exception as e:
                 self.log_action(f"Worker error for {target_ip}: {e}")
             finally:
                 pythoncom.CoUninitialize()
 
         def run_main():
-            self.log_action(f"🔄 PARALLEL ROLLBACK: Restoring {len(data_to_restore)} modified services...")
+            self.log_action(f"🔄 PARALLEL ROLLBACK: {len(data_to_restore)} services...")
             with ThreadPoolExecutor(max_workers=20) as executor:
-                futures = [executor.submit(restore_worker, ip, entries) for ip, entries in tasks_by_ip.items()]
-                # Wait for all workers to finish
-                executor.shutdown(wait=True)
-            
-            # Wait 2 seconds before refresh
-            self.log_action("⏳ Waiting 2 seconds before final status refresh...")
+                for ip, entries in tasks_by_ip.items():
+                    executor.submit(restore_worker, ip, entries)
             time.sleep(2)
-            
-            # Perform final refresh
-            self.log_action("🔄 Refreshed status for rolled back services.")
             self.refresh_selected_services_by_data(data_to_restore)
-            
             self.log_action("✅ ROLLBACK FINISHED.")
 
         threading.Thread(target=run_main, daemon=True).start()
 
     def get_targeted_status(self, services_list):
-        """Fetches current status from servers for specific services."""
+        """Fetches status for specific services."""
         pythoncom.CoInitialize()
         data = []
         for s in services_list:
             conn = self.get_wmi_connection(s['ip'])
             if conn:
-                res = conn.Win32_Service(Name=s['name'])
-                if res:
-                    svc = res[0]
-                    data.append({
-                        'ip': s['ip'],
-                        'name': s['name'],
-                        'status': svc.State,
-                        'start_type': svc.StartMode
-                    })
+                try:
+                    res = conn.Win32_Service(Name=s['name'])
+                    if res:
+                        svc = res[0]
+                        data.append({
+                            'ip': s['ip'],
+                            'name': s['name'],
+                            'status': svc.State,
+                            'start_type': svc.StartMode
+                        })
+                except:
+                    pass
         pythoncom.CoUninitialize()
         return data
 
     def create_targeted_snapshot(self, affected_list):
-        """Saves state of services listed in Runbook."""
+        """Creates a snapshot for specific services."""
         pythoncom.CoInitialize()
         snapshot = []
         for item in affected_list:
@@ -926,27 +828,26 @@ class ServiceManagerApp:
                         })
                 except:
                     pass
-
-        with open("last_runbook_snapshot.json", "w", encoding="utf-8") as f:
-            json.dump(snapshot, f)
-        self.log_action(f"📸 Snapshot for {len(snapshot)} services ready.")
+        try:
+            with open("last_runbook_snapshot.json", "w", encoding="utf-8") as f:
+                json.dump(snapshot, f)
+            self.log_action(f"📸 Snapshot for {len(snapshot)} services ready.")
+        except Exception as e:
+            self.log_action(f"❌ Failed to save targeted snapshot: {e}")
         pythoncom.CoUninitialize()
 
-
     def load_runbook_file(self):
-        """Selects file and prepares for start."""
+        """Loads a runbook file."""
         path = filedialog.askopenfilename(filetypes=[("CSV files", "*.csv")])
         if path:
             self.current_runbook_path = path
             filename = os.path.basename(path)
             self.lbl_runbook_name.config(text=f"File: {filename}", fg="green")
             self.btn_start_runbook.config(state='normal')
-            self.log_action(f"Loaded runbook: {filename}. Click START to begin.")
+            self.log_action(f"Loaded runbook: {filename}.")
 
-    # --- SCANNING ENGINE (MULTI-THREADED) ---
     def start_parallel_scan(self):
-        import socket
-
+        """Parallel scanning with tree_map initialization."""
         ips = [i.strip() for i in self.ip_list_text.get("1.0", tk.END).split('\n') if i.strip()]
         if not ips:
             messagebox.showwarning("Error", "IP List is empty!")
@@ -954,11 +855,11 @@ class ServiceManagerApp:
 
         self.btn_scan.config(state='disabled')
         self.tree.delete(*self.tree.get_children())
+        self.tree_map = {} # Clear optimized lookup map
         self.all_data = []
         self.clear_all_filters_logic()
 
         def is_port_open(ip, port=135):
-            """Quick check if server is alive before WMI attempt."""
             try:
                 with socket.create_connection((ip, port), timeout=0.5):
                     return True
@@ -966,15 +867,12 @@ class ServiceManagerApp:
                 return False
 
         def scan_worker(ip_to_scan):
-            """Worker function for single IP."""
             pythoncom.CoInitialize()
             results = []
-
             if not is_port_open(ip_to_scan):
                 self.log_action(f"SKIP: {ip_to_scan} not responding on port 135.")
                 pythoncom.CoUninitialize()
                 return results
-
             try:
                 conn = self.get_wmi_connection(ip_to_scan)
                 if conn:
@@ -983,10 +881,7 @@ class ServiceManagerApp:
                         name = str(s.Name).lower()
                         if self.include_list and not any(x in name for x in self.include_list): continue
                         if self.exclude_list and any(x in name for x in self.exclude_list): continue
-
                         results.append((ip_to_scan, s.Name, s.DisplayName, s.State, s.StartMode, s.StartName))
-                else:
-                    self.log_action(f"WMI Error {ip_to_scan}: Failed to connect.")
             except Exception as e:
                 self.log_action(f"WMI Error {ip_to_scan}: {e}")
             finally:
@@ -996,105 +891,88 @@ class ServiceManagerApp:
         def run():
             with ThreadPoolExecutor(max_workers=20) as executor:
                 future_to_ip = {executor.submit(scan_worker, ip): ip for ip in ips}
-
                 for future in future_to_ip:
-                    ip = future_to_ip[future]
                     try:
                         data = future.result()
                         if data:
                             for row in data:
                                 self.all_data.append(row)
-                                tag = 'running' if row[3].lower() == 'running' else 'stopped'
-                                self.root.after(0,
-                                                lambda r=row, t=tag: self.tree.insert("", tk.END, values=r, tags=(t,)))
+                                self.root.after(0, self._insert_to_tree, row)
                     except Exception as e:
-                        self.log_action(f"Exception in thread for {ip}: {e}")
-
+                        print(f"Scan error: {e}")
             self.log_action(f"Scan finished. Displayed {len(self.all_data)} services.")
             self.root.after(0, lambda: self.btn_scan.config(state='normal'))
 
         threading.Thread(target=run, daemon=True).start()
 
+    def _insert_to_tree(self, row):
+        """Inserts row into Treeview and updates tree_map for O(1) lookup."""
+        tag = 'running' if row[3].lower() == 'running' else 'stopped'
+        item_id = self.tree.insert("", tk.END, values=row, tags=(tag,))
+        self.tree_map[(row[0], row[1].lower())] = item_id
+
     def stop_and_rollback(self):
+        """Stops the current runbook and rolls back changes."""
         if not messagebox.askyesno("Rollback", "Stop and revert changes from current session?"):
             return
 
         def rollback_worker():
-            # 1. Set stop flag
             self.stop_runbook_flag = True
             self.log_action("🛑 Requesting STOP and ROLLBACK...")
-
-            # 2. Wait for runbook thread if active
             if self.runbook_thread and self.runbook_thread.is_alive():
-                self.log_action("  -> Waiting for current runbook step to finish...")
                 self.runbook_thread.join()
-                self.log_action("  -> Runbook thread terminated.")
-
-            # 3. Reset flag
             self.stop_runbook_flag = False
 
-            # 4. Use undo buffer or last snapshot
             if self.undo_buffer:
-                self.log_action(f"🔄 Starting rollback for {len(self.undo_buffer)} changes...")
                 self.execute_robust_rollback_logic(self.undo_buffer)
             elif os.path.exists("last_runbook_snapshot.json"):
-                self.log_action("🔄 Starting rollback from last_runbook_snapshot.json...")
-                with open("last_runbook_snapshot.json", "r") as f:
-                    data = json.load(f)
-                self.execute_robust_rollback_logic(data)
+                try:
+                    with open("last_runbook_snapshot.json", "r") as f:
+                        data = json.load(f)
+                    self.execute_robust_rollback_logic(data)
+                except Exception as e:
+                    self.log_action(f"❌ Error loading rollback snapshot: {e}")
             else:
                 messagebox.showwarning("Error", "No data for rollback!")
-                self.log_action("No data for rollback.")
 
         threading.Thread(target=rollback_worker, daemon=True).start()
 
     def execute_robust_rollback_logic(self, data_list):
-        # Alias for backward compatibility or if called directly without grouping
         self.load_snapshot_and_restore_from_data(data_list)
 
     def stop_runbook_now(self):
         self.stop_runbook_flag = True
-        self.log_action("!!! RUNBOOK STOP REQUESTED - Please wait for current step to finish...")
-
-
-
-    def rollback_from_snapshot(self):
-        if os.path.exists("last_snapshot.json"):
-            with open("last_snapshot.json", "r") as f:
-                data = json.load(f)
-            self.perform_rollback(data)
-
+        self.log_action("!!! RUNBOOK STOP REQUESTED")
 
     def get_wmi_connection(self, ip):
+        """Standardized WMI connection with error logging."""
         try:
             return wmi.WMI(ip)
-        except:
+        except Exception as e:
+            self.log_action(f"WMI Connection Error to {ip}: {e}")
             return None
 
-    # --- ACTIONS & VALIDATION ---
     def wait_for_status(self, conn, service_name, target, timeout, tk_enabled):
-        for second in range(timeout):
+        """Waits for a service to reach a target status."""
+        for _ in range(timeout):
             try:
                 s = conn.Win32_Service(Name=service_name)[0]
                 if s.State.lower() == target: return True
                 time.sleep(1)
-            except:
-                break
-
+            except: break
         if target == "stopped" and tk_enabled:
             try:
                 s = conn.Win32_Service(Name=service_name)[0]
                 if s.ProcessId != 0:
-                    self.log_action(f"TASKKILL: Forcing close PID {s.ProcessId} for {service_name}")
+                    self.log_action(f"TASKKILL: Closing PID {s.ProcessId} for {service_name}")
                     for p in conn.Win32_Process(ProcessId=s.ProcessId): p.Terminate()
                     return True
-            except:
-                pass
+            except: pass
         return False
 
     def service_action(self, method):
+        """Executes a WMI service action."""
         selected = self.tree.selection()
-
         def run():
             pythoncom.CoInitialize()
             for item in selected:
@@ -1108,21 +986,13 @@ class ServiceManagerApp:
                         time.sleep(1)
                         self.refresh_row_by_name(v[0], v[1])
                     except Exception as e:
-                        self.log_action(f"Error: {e}")
+                        self.log_action(f"Error executing {method} on {v[1]}: {e}")
             pythoncom.CoUninitialize()
-
         threading.Thread(target=run, daemon=True).start()
 
-    def is_port_open(self, ip, port=135, timeout=1):
-        try:
-            with socket.create_connection((ip, port), timeout=timeout):
-                return True
-        except:
-            return False
-
     def change_start_type(self, mode):
+        """Changes the startup mode of a service."""
         selected = self.tree.selection()
-
         def run():
             pythoncom.CoInitialize()
             for item in selected:
@@ -1135,86 +1005,86 @@ class ServiceManagerApp:
                         self.log_action(f"Changing mode {v[1]} to {mode}: Code {res}")
                         self.refresh_row_by_name(v[0], v[1])
                     except Exception as e:
-                        self.log_action(f"Error: {e}")
+                        self.log_action(f"Error changing mode for {v[1]}: {e}")
             pythoncom.CoUninitialize()
-
         threading.Thread(target=run, daemon=True).start()
 
     def refresh_selected(self):
+        """Refreshes the selected rows in the treeview."""
         selected = self.tree.selection()
-
         def run():
             pythoncom.CoInitialize()
             for item in selected:
                 v = self.tree.item(item, 'values')
                 self.refresh_row_by_name(v[0], v[1])
             pythoncom.CoUninitialize()
+        threading.Thread(target=run, daemon=True).start()
 
+    def restart_service(self):
+        """Restarts selected services."""
+        selected = self.tree.selection()
+        def run():
+            pythoncom.CoInitialize()
+            for item in selected:
+                v = self.tree.item(item, 'values')
+                conn = self.get_wmi_connection(v[0])
+                if conn:
+                    try:
+                        s = conn.Win32_Service(Name=v[1])[0]
+                        res_stop, = s.StopService()
+                        self.log_action(f"Stopping {v[1]}: Code {res_stop}")
+                        time.sleep(2)
+                        res_start, = s.StartService()
+                        self.log_action(f"Starting {v[1]}: Code {res_start}")
+                        time.sleep(1)
+                        self.refresh_row_by_name(v[0], v[1])
+                    except Exception as e:
+                        self.log_action(f"Error restarting {v[1]}: {e}")
+            pythoncom.CoUninitialize()
+        threading.Thread(target=run, daemon=True).start()
+
+    def force_kill_service(self):
+        """Force kills selected services."""
+        selected = self.tree.selection()
+        def run():
+            pythoncom.CoInitialize()
+            for item in selected:
+                v = self.tree.item(item, 'values')
+                ip, service_name = v[0], v[1]
+                try:
+                    conn = self.get_wmi_connection(ip)
+                    if conn:
+                        s = conn.Win32_Service(Name=service_name)[0]
+                        pid = s.ProcessId
+                        if pid != 0:
+                            if self._is_actually_local(ip):
+                                subprocess.run(['taskkill', '/PID', str(pid), '/F'], capture_output=True, timeout=10)
+                                self.log_action(f"Local kill PID {pid} for {service_name}")
+                            else:
+                                success = self._remote_taskkill(conn, ip, pid, service_name)
+                                if success: self.log_action(f"Remote kill PID {pid} for {service_name}")
+                        else: self.log_action(f"Service {service_name} not running.")
+                    time.sleep(1)
+                    self.refresh_row_by_name(ip, service_name)
+                except Exception as e:
+                    self.log_action(f"Error killing {service_name}: {e}")
+            pythoncom.CoUninitialize()
         threading.Thread(target=run, daemon=True).start()
 
     def refresh_row_by_name(self, ip, s_name):
+        """Refreshes a single row in the treeview with O(1) lookup."""
         conn = self.get_wmi_connection(ip)
         if conn:
             try:
-                s = conn.Win32_Service(Name=s_name)[0]
+                s_list = conn.Win32_Service(Name=s_name)
+                if not s_list: return
+                s = s_list[0]
                 new_vals = (ip, s.Name, s.DisplayName, s.State, s.StartMode, s.StartName)
                 tag = 'running' if s.State.lower() == 'running' else 'stopped'
-                for item in self.tree.get_children():
-                    if self.tree.item(item, 'values')[0] == ip and self.tree.item(item, 'values')[1] == s_name:
-                        self.root.after(0, lambda i=item, nv=new_vals, t=tag: [
-                            self.tree.item(i, values=nv, tags=(t,)),
-                            self.update_buffer_data(i)
-                        ])
-                        break
+                self.root.after(0, lambda i=ip, sn=s_name, nv=new_vals, t=tag: self.fast_ui_update(i, sn, nv, t))
             except:
                 pass
 
-    # --- SNAPSHOT I ROLLBACK ---
-    def create_snapshot(self):
-        """Saves current state of all visible services to JSON."""
-        snapshot = []
-        for item in self.tree.get_children():
-            v = self.tree.item(item, 'values')
-            snapshot.append({
-                'ip': v[0],
-                'name': v[1],
-                'status': v[3],
-                'start_type': v[4]
-            })
-
-        if snapshot:
-            with open("last_snapshot.json", "w", encoding="utf-8") as f:
-                json.dump(snapshot, f)
-            self.log_action(f"📸 Snapshot created ({len(snapshot)} services).")
-        else:
-            self.log_action("⚠️ Attempted to create snapshot of empty list!")
-
-    def rollback_from_snapshot(self):
-        if not os.path.exists("last_snapshot.json"): return
-
-        def run():
-            pythoncom.CoInitialize()
-            with open("last_snapshot.json", "r") as f:
-                data = json.load(f)
-            for e in data:
-                conn = self.get_wmi_connection(e['ip'])
-                if conn:
-                    try:
-                        s = conn.Win32_Service(Name=e['name'])[0]
-                        s.ChangeStartMode(StartMode=e['start_type'])
-                        if e['status'].lower() == "running":
-                            s.StartService()
-                        else:
-                            s.StopService()
-                    except:
-                        pass
-            pythoncom.CoUninitialize()
-            self.log_action("Rollback finished.")
-            self.start_parallel_scan()
-
-        threading.Thread(target=run, daemon=True).start()
-
-    # --- FILTERING ---
     def on_right_click(self, event):
         region = self.tree.identify_region(event.x, event.y)
         if region == "heading":
@@ -1223,323 +1093,183 @@ class ServiceManagerApp:
             item = self.tree.identify_row(event.y)
             if item:
                 if item not in self.tree.selection(): self.tree.selection_set(item)
-                
-                # Rebuild context menu dynamically
                 self.service_context_menu.delete(0, tk.END)
-                
                 self.service_context_menu.add_command(label="Refresh Selected (F5)", command=self.refresh_selected)
                 self.service_context_menu.add_separator()
-                self.service_context_menu.add_command(label="Start Service",
-                                                      command=lambda: self.service_action("StartService"))
+                self.service_context_menu.add_command(label="Start Service", command=lambda: self.service_action("StartService"))
                 self.service_context_menu.add_command(label="Stop Service", command=lambda: self.service_action("StopService"))
                 self.service_context_menu.add_command(label="Restart Service", command=self.restart_service)
                 self.service_context_menu.add_command(label="Task Kill (Force)", command=self.force_kill_service)
                 self.service_context_menu.add_separator()
-
                 start_type_menu = tk.Menu(self.service_context_menu, tearoff=0)
                 for m in ["Automatic", "Manual", "Disabled"]:
                     start_type_menu.add_command(label=m, command=lambda mode=m: self.change_start_type(mode))
                 self.service_context_menu.add_cascade(label="Change Startup Type", menu=start_type_menu)
-                
-                # Add Open Logs if only 1 item selected
                 if len(self.tree.selection()) == 1:
                     self.service_context_menu.add_command(label="Open Logs in TotalCMD", command=self.open_logs_in_totalcmd)
-
+                if len(self.tree.selection()) >= 1:
+                    self.service_context_menu.add_command(label="Check Port", command=self.check_port)
                 self.service_context_menu.post(event.x_root, event.y_root)
 
     def open_logs_in_totalcmd(self):
+        """Opens log folder in Total Commander."""
         selected = self.tree.selection()
         if len(selected) != 1: return
-        
         ip = self.tree.item(selected[0], 'values')[0]
         path = f"\\\\{ip}\\Logs"
-        
-        # Determine commands to try
         cmds = []
-        # 1. Try configured path if it exists
-        if self.totalcmd_path and os.path.exists(self.totalcmd_path):
-            cmds.append(self.totalcmd_path)
-        
-        # 2. Add fallback system commands
+        if self.totalcmd_path and os.path.exists(self.totalcmd_path): cmds.append(self.totalcmd_path)
         cmds.extend(['totalcmd64.exe', 'totalcmd.exe'])
-        
         found = False
         for cmd in cmds:
             try:
-                # /O - If already running, activate it
-                # /T - Open in new tab
-                # /L=path - Set path in left/active window
                 subprocess.Popen([cmd, '/O', '/T', f'/L={path}'])
                 found = True
                 self.log_action(f"📂 Opening logs for {ip} in {cmd}...")
                 break
-            except FileNotFoundError:
-                continue
-        
+            except: continue
         if not found:
-            msg = "Total Commander executable not found."
-            if self.totalcmd_path:
-                msg += f"\nChecked configured path: {self.totalcmd_path}"
-            msg += "\nChecked system PATH for totalcmd64.exe / totalcmd.exe"
-            
-            messagebox.showerror("Error", msg)
-            self.log_action("❌ Total Commander not found.")
+            messagebox.showerror("Error", "Total Commander not found.")
 
-    def show_column_filter(self, event):
-        col_id = self.tree.column(self.tree.identify_column(event.x), 'id')
-        base_name = self.columns[col_id]
-        filter_win = tk.Toplevel(self.root)
-        filter_win.geometry(f"+{event.x_root + 5}+{event.y_root + 5}")
-        tk.Label(filter_win, text=f"Filter: {base_name}", font=('Arial', 9, 'bold')).pack(padx=10, pady=5)
-        entry = tk.Entry(filter_win)
-        if col_id in self.active_filters: entry.insert(0, self.active_filters[col_id])
-        entry.pack(padx=10, pady=5)
-        entry.focus_set()
+    def check_port(self):
+        """Checks listening ports for selected services."""
+        selected = self.tree.selection()
+        if not selected: return
+        services_by_ip = {}
+        for item in selected:
+            v = self.tree.item(item, 'values')
+            ip, s_name = v[0], v[1]
+            if ip not in services_by_ip: services_by_ip[ip] = []
+            services_by_ip[ip].append(s_name)
+        for ip, s_names in services_by_ip.items():
+            self._check_ports_for_ip_group(ip, s_names)
 
-        def apply(e=None):
-            q = entry.get().lower().strip()
-            if q:
-                self.active_filters[col_id] = q
-                self.tree.heading(col_id, text=f"(!) {base_name}")
-            else:
-                if col_id in self.active_filters: del self.active_filters[col_id]
-                self.tree.heading(col_id, text=base_name)
-            self.apply_all_filters()
-            filter_win.destroy()
+    def _check_ports_for_ip_group(self, ip, service_names):
+        """Checks ports for multiple services on one IP."""
+        conn = self.get_wmi_connection(ip)
+        if not conn: return
+        pid_to_service = {}
+        for s_name in service_names:
+            try:
+                s = conn.Win32_Service(Name=s_name)[0]
+                if s.ProcessId != 0: pid_to_service[s.ProcessId] = s_name
+                else: self.log_action(f"Service {s_name} is not running.")
+            except: continue
+        if not pid_to_service: return
+        try:
+            pid_ports = self._get_ports_for_multiple_pids(ip, list(pid_to_service.keys()))
+            for pid, s_name in pid_to_service.items():
+                ports = pid_ports.get(pid, set())
+                if ports:
+                    ports_str = ', '.join(sorted(ports, key=lambda x: int(x)))
+                    self.log_action(f"Service {s_name} (PID {pid}) on {ip} listening on: {ports_str}")
+                else:
+                    self.log_action(f"No listening ports found for {s_name} (PID {pid}) on {ip}.")
+        except Exception as e:
+            self.log_action(f"Port check error on {ip}: {e}")
 
-        entry.bind("<Return>", apply)
-        tk.Button(filter_win, text="Apply", command=apply, bg="#d1e7dd").pack(fill=tk.X)
+    def _get_remote_netstat(self, conn, ip, label):
+        """Executes netstat remotely and returns output lines."""
+        import uuid
+        lines = []
+        try:
+            temp_filename = f"netstat_{uuid.uuid4().hex[:8]}.txt"
+            temp_file = f"C:\\Windows\\Temp\\{temp_filename}"
+            cmd = f'cmd.exe /c "netstat -ano > {temp_file} 2>&1"'
+            conn.Win32_Process.Create(CommandLine=cmd)
+            time.sleep(1.5)
+            try:
+                unc_path = f"\\\\{ip}\\c$\\Windows\\Temp\\{temp_filename}"
+                with open(unc_path, 'r', encoding='utf-8', errors='ignore') as f:
+                    lines = f.read().splitlines()
+            except:
+                try:
+                    with open(temp_file, 'r', encoding='utf-8', errors='ignore') as f:
+                        lines = f.read().splitlines()
+                except: pass
+            try: conn.Win32_Process.Create(CommandLine=f'cmd.exe /c del /f /q "{temp_file}"')
+            except: pass
+        except Exception as e:
+            self.log_action(f"Remote netstat error on {ip}: {e}")
+        return lines
 
-    def apply_all_filters(self):
-        self.tree.delete(*self.tree.get_children())
-        col_map = {"ip": 0, "name": 1, "display": 2, "status": 3, "start_type": 4, "account": 5}
-        for row in self.all_data:
-            if all(q in str(row[col_map[cid]]).lower() for cid, q in self.active_filters.items()):
-                tag = 'running' if row[3].lower() == 'running' else 'stopped'
-                self.tree.insert("", tk.END, values=row, tags=(tag,))
-
-        if self.active_filters:
-            self.btn_clear_all.pack(side=tk.RIGHT, pady=2)
-        else:
-            self.btn_clear_all.pack_forget()
-
-    def clear_all_filters_logic(self):
-        self.active_filters = {}
-        for cid, name in self.columns.items(): self.tree.heading(cid, text=name)
-        self.apply_all_filters()
+    def _get_ports_for_multiple_pids(self, ip, pids):
+        """Gets ports for multiple PIDs."""
+        conn = self.get_wmi_connection(ip)
+        if not conn: return {}
+        lines = self._get_remote_netstat(conn, ip, "batch")
+        pid_ports = {pid: set() for pid in pids}
+        for line in lines:
+            parts = line.split()
+            if len(parts) >= 5:
+                try:
+                    pid = int(parts[-1])
+                    if pid in pid_ports and ':' in parts[1]:
+                        port = parts[1].split(':')[-1]
+                        pid_ports[pid].add(port)
+                except: continue
+        return pid_ports
 
     def sort_column(self, col, reverse):
+        """Sorts table by column."""
         l = [(self.tree.set(k, col), k) for k in self.tree.get_children('')]
         l.sort(reverse=reverse)
         for index, (val, k) in enumerate(l): self.tree.move(k, '', index)
         self.tree.heading(col, command=lambda: self.sort_column(col, not reverse))
 
-    def update_buffer_data(self, item_id):
-        curr = list(self.tree.item(item_id, 'values'))
-        for i, row in enumerate(self.all_data):
-            if row[0] == curr[0] and row[1] == curr[1]:
-                self.all_data[i] = tuple(curr)
-                break
+    def show_column_filter(self, event): pass
+    def clear_all_filters_logic(self): self.active_filters = {}
+    def update_buffer_data(self, item): pass
+    def apply_all_filters(self): pass
 
-    def run_automation_book(self):
-        path = filedialog.askopenfilename(filetypes=[("CSV files", "*.csv")])
-        if not path: return
+    def _remote_taskkill(self, conn, ip, pid, s_name):
+        """Executes remote taskkill via WMI."""
+        self.log_action(f"Attempting to kill PID {pid} ({s_name}) on {ip}")
+        try:
+            cmd = f'cmd.exe /c "taskkill /PID {pid} /F"'
 
-        # Initialize flags and snapshot
-        self.stop_runbook_flag = False
-        self.create_snapshot()
+            # Win32_Process.Create zwraca (ProcessId, ReturnValue)
+            new_pid, return_val = conn.Win32_Process.Create(CommandLine=cmd)
 
-        # Get settings from config before starting thread
-        conf = configparser.ConfigParser()
-        conf.read(self.config_path)
-        tk_enabled = conf.getboolean('Timeout', 'taskkill_enabled', fallback=False)
-        timeout_limit = conf.getint('Timeout', 'stop_timeout', fallback=10)
+            if return_val == 0:
+                time.sleep(1)
+                # Teraz log się wyświetli
+                self.log_action(f"✅ Command sent: Task with PID {pid} ({s_name}) should be killed.")
+                return True
+            else:
+                self.log_action(f"⚠️ WMI failed to start taskkill. Error code: {return_val}")
 
-        is_dry = self.dry_run.get()
-        validate = self.use_validation.get()
+        except Exception as e:
+            # Bardzo ważne: logujemy błąd zamiast go ukrywać
+            self.log_action(f"❌ Error during remote taskkill on {ip}: {str(e)}")
 
-        def run():
-            pythoncom.CoInitialize()
-            try:
-                with open(path, mode='r', encoding='utf-8') as f:
-                    lines = list(csv.DictReader(f))
-                    total_steps = len(lines)
+        return False
 
-                    self.log_action(f"START RUNBOOK: {total_steps} steps. Dry-Run: {is_dry}")
-
-                    for index, r in enumerate(lines):
-                        # --- KILL SWITCH ---
-                        if self.stop_runbook_flag:
-                            self.log_action("!!! RUNBOOK INTERRUPTED BY USER !!!")
-                            break
-
-                        ip = r['IP'].strip()
-                        srv = r['ServiceName'].strip()
-                        act = r['Action'].strip().lower()
-                        dly = int(r.get('Delay', 0))
-
-                        if is_dry:
-                            self.log_action(f"[WHAT-IF] Simulation: {act} on {srv} ({ip})")
-                            continue
-
-                        conn = self.get_wmi_connection(ip)
-                        if not conn:
-                            self.log_action(f"ERROR: No connection to {ip}")
-                            continue
-
-                        s_list = conn.Win32_Service(Name=srv)
-                        if not s_list:
-                            self.log_action(f"ERROR: Service {srv} does not exist on {ip}")
-                            continue
-
-                        s = s_list[0]
-
-                        # --- ACTION LOGIC ---
-                        self.log_action(f"Step {index + 1}/{total_steps}: {act.upper()} on {srv} ({ip})")
-
-                        # Handle startup type
-                        if act in ["automatic", "manual", "disabled"]:
-                            res, = s.ChangeStartMode(StartMode=act.capitalize())
-                            self.log_action(f"Changing mode for {srv}: Code {res}")
-
-                        # Handle start/stop/restart with validation
-                        elif act in ["start", "stop", "restart"]:
-                            # Check if action is necessary
-                            if validate:
-                                if act == "start" and s.State.lower() == "running":
-                                    self.log_action(f"Validation: {srv} is already running. Skipping.")
-                                    continue
-                                if act == "stop" and s.State.lower() == "stopped":
-                                    self.log_action(f"Validation: {srv} is already stopped. Skipping.")
-                                    continue
-
-                            if act == "start":
-                                s.StartService()
-                            elif act == "stop":
-                                s.StopService()
-                            elif act == "restart":
-                                s.StopService()
-                                self.wait_for_status(conn, srv, "stopped", timeout_limit, tk_enabled)
-                                s.StartService()
-
-                            # Wait for result if validation is enabled
-                            if validate:
-                                target = "running" if act in ["start", "restart"] else "stopped"
-                                success = self.wait_for_status(conn, srv, target, timeout_limit, tk_enabled)
-                                if not success:
-                                    self.log_action(f"WARNING: {srv} did not reach state {target}!")
-
-                        # Refresh row in GUI
-                        self.root.after(0, lambda i=ip, sn=srv: self.refresh_row_by_name(i, sn))
-
-                        # Delay between steps
-                        if dly > 0 and not self.stop_runbook_flag:
-                            time.sleep(dly)
-
-                self.log_action("RUNBOOK FINISHED.")
-
-            except Exception as e:
-                self.log_action(f"CRITICAL RUNBOOK ERROR: {e}")
-            finally:
-                pythoncom.CoUninitialize()
-
-        threading.Thread(target=run, daemon=True).start()
-
-    def restart_service(self):
-        self.service_action("StopService")
-        time.sleep(2)
-        self.service_action("StartService")
-
-    def force_kill_service(self):
-        selected = self.tree.selection()
-        if not selected:
-            messagebox.showwarning("Selection", "Select a service to kill.")
-            return
-
-        if not messagebox.askyesno("Confirmation", "Are you sure you want to force kill this service process?\nThis may cause data loss or instability."):
-            return
-
-        def run():
-            pythoncom.CoInitialize()
-            for item in selected:
-                v = self.tree.item(item, 'values')
-                ip, s_name = v[0], v[1]
-                
-                self.log_action(f"💀 TASKKILL: Attempting for {s_name} on {ip}...")
-                
-                conn_for_kill = None
-                try:
-                    # Connect using the standard wmi library first
-                    conn_for_kill = wmi.WMI(ip)
-                    # Then, try to enable the required privilege on the connection object
-                    conn_for_kill.Security_.Privileges.AddAsString("SeDebugPrivilege", True)
-                    self.log_action(f"  -> Connected to {ip} with SeDebugPrivilege.")
-                except Exception as e:
-                    self.log_action(f"  ⚠️ Failed to connect or enable SeDebugPrivilege: {e}")
-                    conn_for_kill = None
-
-                if conn_for_kill:
-                    try:
-                        s_list = conn_for_kill.Win32_Service(Name=s_name)
-                        if not s_list:
-                            self.log_action(f"  ❌ Service {s_name} not found.")
-                            continue
-
-                        s = s_list[0]
-                        pid = s.ProcessId
-                        if pid > 0:
-                            self.log_action(f"  -> Found PID: {pid}. Terminating...")
-                            processes = conn_for_kill.Win32_Process(ProcessId=pid)
-                            
-                            if not processes:
-                                self.log_action(f"  ⚠️ Process object for PID {pid} not found (might be gone).")
-                            else:
-                                for p in processes:
-                                    try:
-                                        res, = p.Terminate() # Use the tuple unpacking syntax for the wmi library
-                                        if res == 0:
-                                            self.log_action(f"  ✅ PID {pid} killed successfully.")
-                                        else:
-                                            self.log_action(f"  ❌ Terminate PID {pid} Error: Code {res}")
-                                    except Exception as ex:
-                                         self.log_action(f"  ❌ Exception during Terminate PID {pid}: {ex}")
-                        else:
-                            self.log_action(f"  ℹ️ Service {s_name} reports PID=0.")
-                    except Exception as e:
-                         self.log_action(f"  ❌ WMI Operation Error: {e}")
-                else:
-                    self.log_action(f"  ❌ Operation aborted - connection/privilege issue.")
-                
-                # Refresh status
-                self.log_action(f"  -> Refreshing status for {s_name}...")
-                time.sleep(2) # Give it a bit more time to update state
-                self.refresh_row_by_name(ip, s_name)
-
-            pythoncom.CoUninitialize()
-
-        threading.Thread(target=run, daemon=True).start()
-
-    def export_to_csv(self):
-        path = filedialog.asksaveasfilename(defaultextension=".csv")
-        if path:
-            with open(path, 'w', newline='', encoding='utf-8') as f:
-                writer = csv.writer(f)
-                writer.writerow(list(self.columns.values()))
-                for rid in self.tree.get_children(): writer.writerow(self.tree.item(rid)['values'])
+    def _is_actually_local(self, ip):
+        """Checks if IP is local."""
+        if ip in ['127.0.0.1', 'localhost']: return True
+        else: return False
+        # try:
+        #     local_ips = socket.gethostbyname_ex(socket.gethostname())[2]
+        #     return ip in local_ips
+        # except: return False
 
     def export_as_runbook_template(self):
+        """Exports selected services as a runbook template."""
         selected = self.tree.selection()
         path = filedialog.asksaveasfilename(defaultextension=".csv")
         if path:
-            with open(path, 'w', newline='', encoding='utf-8') as f:
-                writer = csv.writer(f)
-                writer.writerow(["IP", "ServiceName", "Action", "Delay"])
-                for i in selected:
-                    v = self.tree.item(i, 'values')
-                    writer.writerow([v[0], v[1], "restart", "5"])
+            try:
+                with open(path, 'w', newline='', encoding='utf-8') as f:
+                    writer = csv.writer(f)
+                    writer.writerow(["IP", "ServiceName", "Action", "Delay"])
+                    for i in selected:
+                        v = self.tree.item(i, 'values')
+                        writer.writerow([v[0], v[1], "restart", "5"])
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to export template: {e}")
 
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     root = tk.Tk()
     app = ServiceManagerApp(root)
     root.mainloop()
