@@ -491,7 +491,7 @@ class ServiceManagerApp:
             self.tree.item(item, tags=('mismatch',))
 
     def load_snapshot_and_restore(self):
-        """Loads snapshot file and forces restore with validation and configurable timeouts."""
+        """Loads snapshot file and forces restore with validation and logging."""
         path = filedialog.askopenfilename(
             filetypes=[("JSON files", "*.json")],
             title="Select snapshot file to restore"
@@ -501,18 +501,18 @@ class ServiceManagerApp:
         try:
             with open(path, 'r', encoding='utf-8') as f:
                 data_to_restore = json.load(f)
-            
-            # Data validation
+
+            # Validation
             if not isinstance(data_to_restore, list):
                 raise ValueError("Snapshot data must be a list.")
             for entry in data_to_restore:
                 if not all(k in entry for k in ('ip', 'name', 'status', 'start_type')):
-                    raise ValueError(f"Invalid entry structure in snapshot: {entry}")
+                    raise ValueError(f"Invalid entry structure: {entry}")
         except Exception as e:
             messagebox.showerror("Error", f"Snapshot validation failed: {e}")
             return
 
-        if not messagebox.askyesno("Confirmation", "Are you sure you want to restore service state from this file?"):
+        if not messagebox.askyesno("Confirmation", f"Restore {len(data_to_restore)} services state?"):
             return
 
         self.stop_runbook_flag = False
@@ -520,79 +520,80 @@ class ServiceManagerApp:
         for entry in data_to_restore:
             tasks_by_ip[entry['ip']].append(entry)
 
+        # Pobranie parametrów z konfiguracji (z rzutowaniem)
+        try:
+            wait_attempts = int(self.config.get('SETTINGS', 'wait_attempts', fallback=10))
+            wait_interval = float(self.config.get('SETTINGS', 'wait_interval', fallback=0.5))
+        except:
+            wait_attempts, wait_interval = 10, 0.5
+
         def restore_worker(target_ip, entries):
             pythoncom.CoInitialize()
             cmd_map = {"automatic": "Automatic", "manual": "Manual", "disabled": "Disabled", "auto": "Automatic"}
-            check_map = {"Automatic": ["Auto", "Automatic"], "Manual": ["Manual", "Manuell"],
-                         "Disabled": ["Disabled", "Deaktiviert"]}
 
             try:
+                self.log_action(f"  [Worker] Connecting to {target_ip}...")
                 conn = self.get_wmi_connection(target_ip)
                 if not conn:
+                    self.log_action(f"  ❌ Connection failed: {target_ip}")
                     return
 
                 for entry in entries:
                     if self.stop_runbook_flag: break
                     s_name = entry.get('name')
                     target_state = entry.get('status', '').lower()
-                    raw_mode = entry.get('start_type', '').lower()
-                    target_cmd = cmd_map.get(raw_mode, "Automatic")
+                    target_cmd = cmd_map.get(entry.get('start_type', '').lower(), "Automatic")
 
                     try:
                         s_list = conn.Win32_Service(Name=s_name)
-                        if not s_list:
-                            self.log_action(f"⚠️ {s_name} on {target_ip}: Service does not exist.")
-                            continue
+                        if not s_list: continue
                         s = s_list[0]
 
-                        current_mode_normalized = s.StartMode.replace("Auto", "Automatic")
-                        if current_mode_normalized != target_cmd:
-                            self.log_action(f"  -> {s_name} ({target_ip}): Changing mode to {target_cmd}")
-                            res, = s.ChangeStartMode(StartMode=target_cmd)
+                        # 1. StartMode Change
+                        current_mode = s.StartMode.replace("Auto", "Automatic")
+                        if current_mode != target_cmd:
+                            self.log_action(f"    -> {target_ip}: {s_name} mode change to {target_cmd}")
+                            # POPRAWKA: res zamiast res,
+                            res = s.ChangeStartMode(StartMode=target_cmd)
+                            if res != 0:
+                                self.log_action(f"    ⚠️ Mode change error {res} on {s_name}")
 
-                            if res == 0:
-                                success_unlock = False
-                                valid_responses = check_map.get(target_cmd, [target_cmd])
-                                # Use configurable timeout
-                                for _ in range(int(self.wait_attempts)):
-                                    time.sleep(self.wait_interval)
-                                    s_check = conn.Win32_Service(Name=s_name)[0]
-                                    if s_check.StartMode in valid_responses:
-                                        success_unlock = True
-                                        break
-                                if not success_unlock:
-                                    self.log_action(f"  [!] Timeout: {s_name} reports {s_check.StartMode}")
-                            else:
-                                self.log_action(f"  [!] {s_name} ChangeStartMode Error: Code {res}")
-
+                        # 2. State Change (Start/Stop)
                         s = conn.Win32_Service(Name=s_name)[0]
                         current_state = s.State.lower()
-                        if target_state == "running" and current_state != "running":
-                            self.log_action(f"  -> {s_name} ({target_ip}): Starting...")
-                            res, = s.StartService()
-                            if res != 0 and res != 10:
-                                self.log_action(f"  [!] {s_name} Start Error: Code {res}")
-                        elif target_state == "stopped" and current_state != "stopped":
-                            self.log_action(f"  -> {s_name} ({target_ip}): Stopping...")
-                            res, = s.StopService()
-                            if res != 0:
-                                self.log_action(f"  [!] {s_name} Stop Error: Code {res}")
 
-                        self.refresh_row_by_name(target_ip, s_name)
+                        if target_state == "running" and current_state != "running":
+                            self.log_action(f"    -> {target_ip}: Starting {s_name}")
+                            res = s.StartService()  # POPRAWKA: res zamiast res,
+                            if res not in [0, 10]:  # 10 = service already running
+                                self.log_action(f"    ⚠️ Start error {res} on {s_name}")
+
+                        elif target_state == "stopped" and current_state != "stopped":
+                            self.log_action(f"    -> {target_ip}: Stopping {s_name}")
+                            res = s.StopService()  # POPRAWKA: res zamiast res,
+                            if res != 0:
+                                self.log_action(f"    ⚠️ Stop error {res} on {s_name}")
+
+                        # Odświeżenie wiersza w UI
+                        self.root.after(0, lambda: self.refresh_row_by_name(target_ip, s_name))
+
                     except Exception as e:
-                        self.log_action(f"❌ Error processing {s_name} on {target_ip}: {e}")
+                        self.log_action(f"    ❌ Error on {s_name}: {e}")
+
+                self.log_action(f"  [Worker] Done for {target_ip}")
             except Exception as e:
-                self.log_action(f"❌ Connection error for {target_ip}: {e}")
+                self.log_action(f"  ❌ connection error {target_ip}: {e}")
             finally:
                 pythoncom.CoUninitialize()
 
         def run_main():
-            self.log_action(f"🔄 STARTING PARALLEL RESTORE FROM: {os.path.basename(path)}")
+            self.log_action(f"🔄 STARTING PARALLEL RESTORE: {os.path.basename(path)}")
             with ThreadPoolExecutor(max_workers=20) as executor:
                 for ip, entries in tasks_by_ip.items():
                     executor.submit(restore_worker, ip, entries)
             self.log_action("✅ RESTORE COMPLETED.")
-            self.refresh_selected_services_by_data(data_to_restore)
+            # Odświeżenie tabeli po zakończeniu
+            self.root.after(0, lambda: self.refresh_all_visible_services())
 
         threading.Thread(target=run_main, daemon=True).start()
 
