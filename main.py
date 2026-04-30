@@ -995,7 +995,7 @@ class ServiceManagerApp:
 
         try:
             # 1. Try native connection (uses Kerberos if hostname is provided)
-            return wmi.WMI(ip, privileges=["Debug"])
+            return wmi.WMI(ip, privileges=["Debug"], authentication_level="PktPrivacy")
         except Exception as e:
             err_str = str(e)
             # 2. If Kerberos fails with Access Denied (0x80041003), fallback to IP to force NTLM
@@ -1004,7 +1004,7 @@ class ServiceManagerApp:
                 try:
                     resolved_ip = socket.gethostbyname(ip)
                     if resolved_ip != ip:
-                        return wmi.WMI(resolved_ip, privileges=["Debug"])
+                        return wmi.WMI(resolved_ip, privileges=["Debug"], authentication_level="PktPrivacy")
                 except socket.gaierror:
                     self.log_action(f"DNS Resolution failed for NTLM fallback on '{ip}'.")
                 except Exception as fallback_e:
