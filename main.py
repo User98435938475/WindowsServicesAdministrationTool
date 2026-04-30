@@ -913,9 +913,9 @@ class ServiceManagerApp:
                 if conn:
                     services = conn.Win32_Service()
                     for s in services:
-                        name = str(s.Name).lower()
-                        if self.include_list and not any(x in name for x in self.include_list): continue
-                        if self.exclude_list and any(x in name for x in self.exclude_list): continue
+                        display_name = str(s.DisplayName).lower()
+                        if self.include_list and not any(x in display_name for x in self.include_list): continue
+                        if self.exclude_list and any(x in display_name for x in self.exclude_list): continue
                         results.append((ip_to_scan, s.Name, s.DisplayName, s.State, s.StartMode, s.StartName))
             except Exception as e:
                 self.log_action(f"WMI Error {ip_to_scan}: {e}")
