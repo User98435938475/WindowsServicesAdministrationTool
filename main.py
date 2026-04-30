@@ -76,9 +76,9 @@ class ServiceManagerApp:
         self.config_path = os.path.join(base_dir, 'config.ini')
         if os.path.exists(self.config_path):
             self.config.read(self.config_path)
-            self.include_list = [x.strip().lower() for x in
+            self.include_list = [x.strip().strip('\'"').lower() for x in
                                  self.config.get('Filters', 'include_names', fallback='').split(',') if x.strip()]
-            self.exclude_list = [x.strip().lower() for x in
+            self.exclude_list = [x.strip().strip('\'"').lower() for x in
                                  self.config.get('Filters', 'exclude_names', fallback='').split(',') if x.strip()]
             self.groups = {k: v for k, v in self.config.items('Groups')} if self.config.has_section('Groups') else {}
 
@@ -257,9 +257,10 @@ class ServiceManagerApp:
     def load_group_ips(self, event):
         group = self.group_var.get()
         if group in self.groups:
-            ips = self.groups[group].replace(',', '\n')
+            ips_list = [ip.strip() for ip in self.groups[group].split(',') if ip.strip()]
+            ips_text = '\n'.join(ips_list)
             self.ip_list_text.delete("1.0", tk.END)
-            self.ip_list_text.insert(tk.END, ips)
+            self.ip_list_text.insert(tk.END, ips_text)
 
     def toggle_auto_refresh(self):
         """Starts or stops the auto-refresh loop."""
