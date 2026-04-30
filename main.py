@@ -941,7 +941,7 @@ class ServiceManagerApp:
         threading.Thread(target=run, daemon=True).start()
 
     def _insert_to_tree(self, row):
-        """Inserts row into Treeview and updates tree_map for O(1) lookup. """
+        """Inserts row into Treeview and updates tree_map for O(1) lookup."""
         tag = 'running' if row[3].lower() == 'running' else 'stopped'
         item_id = self.tree.insert("", tk.END, values=row, tags=(tag,))
         self.tree_map[(row[0], row[1].lower())] = item_id
@@ -993,7 +993,11 @@ class ServiceManagerApp:
             self.log_action(f"SECURITY BLOCK: Invalid IP/Hostname format for '{ip}'")
             return None
         try:
-            return wmi.WMI(ip, privileges=["Debug"])
+            resolved_ip = socket.gethostbyname(ip)
+            return wmi.WMI(resolved_ip, privileges=["Debug"])
+        except socket.gaierror as e:
+            self.log_action(f"DNS Resolution Error for '{ip}': {e}")
+            return None
         except Exception as e:
             self.log_action(f"WMI Connection Error to {ip}: {e}")
             return None
