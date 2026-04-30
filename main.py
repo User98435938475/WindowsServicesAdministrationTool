@@ -988,17 +988,28 @@ class ServiceManagerApp:
         return True
 
     def get_wmi_connection(self, ip):
-        """Standardized WMI connection with error logging."""
+        """Standardized WMI connection with error logging and NTLM fallback."""
         if not self.is_valid_target(ip):
             self.log_action(f"SECURITY BLOCK: Invalid IP/Hostname format for '{ip}'")
             return None
+
         try:
-            resolved_ip = socket.gethostbyname(ip)
-            return wmi.WMI(resolved_ip, privileges=["Debug"])
-        except socket.gaierror as e:
-            self.log_action(f"DNS Resolution Error for '{ip}': {e}")
-            return None
+            # 1. Try native connection (uses Kerberos if hostname is provided)
+            return wmi.WMI(ip, privileges=["Debug"])
         except Exception as e:
+            err_str = str(e)
+            # 2. If Kerberos fails with Access Denied (0x80041003), fallback to IP to force NTLM
+            if "0x80041003" in err_str or "Access is denied" in err_str or "-2147217405" in err_str:
+                self.log_action(f"Kerberos access denied for '{ip}'. Forcing NTLM fallback...")
+                try:
+                    resolved_ip = socket.gethostbyname(ip)
+                    if resolved_ip != ip:
+                        return wmi.WMI(resolved_ip, privileges=["Debug"])
+                except socket.gaierror:
+                    self.log_action(f"DNS Resolution failed for NTLM fallback on '{ip}'.")
+                except Exception as fallback_e:
+                    self.log_action(f"WMI NTLM Fallback Error for {ip}: {fallback_e}")
+
             self.log_action(f"WMI Connection Error to {ip}: {e}")
             return None
 
