@@ -941,7 +941,7 @@ class ServiceManagerApp:
         threading.Thread(target=run, daemon=True).start()
 
     def _insert_to_tree(self, row):
-        """Inserts row into Treeview and updates tree_map for O(1) lookup."""
+        """Inserts row into Treeview and updates tree_map for O(1) lookup. """
         tag = 'running' if row[3].lower() == 'running' else 'stopped'
         item_id = self.tree.insert("", tk.END, values=row, tags=(tag,))
         self.tree_map[(row[0], row[1].lower())] = item_id
