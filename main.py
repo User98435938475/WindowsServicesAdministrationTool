@@ -159,7 +159,7 @@ class ServiceManagerApp:
 
         tk.Label(ar_frame, text="Sec:").pack(side=tk.LEFT, padx=2)
         self.ent_refresh_interval = tk.Entry(ar_frame, width=3)
-        self.ent_refresh_interval.insert(0, "10")
+        self.ent_refresh_interval.insert(0, "30")
         self.ent_refresh_interval.pack(side=tk.LEFT)
 
         # Scan Button
@@ -276,12 +276,18 @@ class ServiceManagerApp:
 
     def auto_refresh_loop(self):
         """Background loop for auto-refreshing services."""
+        MIN_INTERVAL = 30  # Minimum interval to avoid GUI freeze on large server sets
         while self.auto_refresh_active:
             try:
                 interval = int(self.ent_refresh_interval.get())
-                if interval < 1: interval = 5
             except ValueError:
-                interval = 10
+                interval = MIN_INTERVAL
+
+            if interval < MIN_INTERVAL:
+                interval = MIN_INTERVAL
+                self.root.after(0, lambda: self.ent_refresh_interval.delete(0, tk.END))
+                self.root.after(0, lambda: self.ent_refresh_interval.insert(0, str(MIN_INTERVAL)))
+                self.log_action(f"⚠️ Auto-refresh interval set to minimum {MIN_INTERVAL}s to prevent GUI freeze.")
 
             for _ in range(interval):
                 if not self.auto_refresh_active:
@@ -684,7 +690,8 @@ class ServiceManagerApp:
             pythoncom.CoInitialize()
             try:
                 with open(self.current_runbook_path, mode='r', encoding='utf-8') as f:
-                    reader = list(csv.DictReader(f))
+                    lines = [line for line in f if not line.strip().startswith('#')]
+                reader = list(csv.DictReader(lines))
 
                 total_steps = len(reader)
                 self.log_action(f"🚀 START RUNBOOK: {total_steps} steps.")
@@ -746,6 +753,31 @@ class ServiceManagerApp:
                                             self.log_action(f"  ℹ️ Already running.")
                                         else:
                                             self.log_action(f"  ❌ Start Error: {res}")
+                                    elif act == "restart":
+                                        res_stop, = s.StopService()
+                                        self.log_action(f"  ⏹️ Stopping {srv}: Code {res_stop}")
+                                        if res_stop == 0:
+                                            for _ in range(int(self.wait_attempts)):
+                                                time.sleep(self.wait_interval)
+                                                if conn.Win32_Service(Name=srv)[0].State.lower() == "stopped":
+                                                    break
+                                        s2 = conn.Win32_Service(Name=srv)[0]
+                                        res_start, = s2.StartService()
+                                        self.log_action(f"  ▶️ Starting {srv}: Code {res_start}")
+                                        if res_start == 0:
+                                            for _ in range(int(self.wait_attempts)):
+                                                time.sleep(self.wait_interval)
+                                                if conn.Win32_Service(Name=srv)[0].State.lower() == "running":
+                                                    self.log_action(f"  ✅ Service {srv} restarted.")
+                                                    break
+                                    elif act == "kill":
+                                        pid = s.ProcessId
+                                        if pid != 0:
+                                            self.log_action(f"  💀 KILL: Terminating PID {pid} for {srv} on {ip}")
+                                            self._remote_taskkill(conn, ip, pid, srv)
+                                        else:
+                                            self.log_action(
+                                                f"  ℹ️ Service {srv} is not running (PID=0). Nothing to kill.")
 
                                 self.refresh_row_by_name(ip, srv)
                         except Exception as inner_e:
@@ -1434,6 +1466,8 @@ class ServiceManagerApp:
         if path:
             try:
                 with open(path, 'w', newline='', encoding='utf-8') as f:
+                    # Write hint comment (skipped automatically during runbook execution)
+                    f.write("# Available actions: stop, start, restart, kill, automatic, manual, disabled\n")
                     writer = csv.writer(f)
                     # Header matching the format expected by load_runbook
                     writer.writerow(["IP", "ServiceName", "Action", "Delay"])
